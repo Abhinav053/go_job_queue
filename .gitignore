@@ -1,0 +1,20 @@
+# Go build outputs
+/go-job-queue
+/go-job-queue.exe
+*.test
+*.out
+
+# Go workspace files
+go.work
+go.work.sum
+
+# Local environment and editor files
+.env
+.env.*
+!.env.example
+.vscode/
+.idea/
+
+# OS files
+.DS_Store
+Thumbs.db
