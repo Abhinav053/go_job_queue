@@ -3,81 +3,89 @@ package main
 import (
 	"context"
 	"errors"
-	"fmt"
+	"log"
+	"net/http"
+	"os"
+	"os/signal"
+	"sync"
+	"syscall"
 	"time"
 )
 
 func main() {
-	handler := func(
-		ctx context.Context,
-		job Job,
-	) error {
-		// Simulate work that takes one second.
-		timer := time.NewTimer(time.Second)
-		defer timer.Stop()
-
-		select {
-		case <-timer.C:
-			if job.ID == 4 {
-				return errors.New(
-					"simulated processing error",
-				)
-			}
-
-			fmt.Printf(
-				"Processed payload: %s\n",
-				job.Payload,
-			)
-			return nil
-
-		case <-ctx.Done():
-			return ctx.Err()
-		}
-	}
-
-	pool, err := NewWorkerPool(3, 5, handler)
-	if err != nil {
-		panic(err)
-	}
-
-	// Submit 10 jobs.
-	for i := 1; i <= 10; i++ {
-		job := Job{
-			ID:      i,
-			Payload: fmt.Sprintf("Task-%d", i),
-		}
-
-		ctx, cancel := context.WithTimeout(
-			context.Background(),
-			3*time.Second,
-		)
-
-		err := pool.Submit(ctx, job)
-		cancel()
-
-		if err != nil {
-			fmt.Printf(
-				"Could not submit job %d: %v\n",
-				job.ID,
-				err,
-			)
-			continue
-		}
-
-		fmt.Printf("Submitted job %d\n", job.ID)
-	}
-
-	// Allow workers to finish their queued work.
-	shutdownCtx, cancel := context.WithTimeout(
+	startupCtx, cancelStartup := context.WithTimeout(
 		context.Background(),
 		10*time.Second,
 	)
-	defer cancel()
 
-	if err := pool.Shutdown(shutdownCtx); err != nil {
-		fmt.Printf("Shutdown error: %v\n", err)
-		return
+	db, err := openDB(startupCtx)
+	cancelStartup()
+
+	if err != nil {
+		log.Fatalf("Database initialization failed: %v", err)
+	}
+	defer db.Close()
+
+	workerCtx, cancelWorkers := context.WithCancel(
+		context.Background(),
+	)
+	var workers sync.WaitGroup
+
+	for i := 1; i <= 3; i++ {
+		workers.Add(1)
+		go workerLoop(workerCtx, i, db, &workers)
 	}
 
-	fmt.Println("Worker pool shut down cleanly.")
+	workers.Add(1)
+	go func() {
+		defer workers.Done()
+		recoveryLoop(workerCtx, db)
+	}()
+
+	api := NewAPI(db)
+
+	server := &http.Server{
+		Addr:              ":8080",
+		Handler:           api.Routes(),
+		ReadHeaderTimeout: 5 * time.Second,
+	}
+
+	serverErr := make(chan error, 1)
+
+	go func() {
+		log.Println("API listening on :8080")
+		serverErr <- server.ListenAndServe()
+	}()
+
+	stop, stopSignal := signal.NotifyContext(
+		context.Background(),
+		os.Interrupt,
+		syscall.SIGTERM,
+	)
+	defer stopSignal()
+
+	select {
+	case <-stop.Done():
+		log.Println("Shutdown signal received")
+	case err := <-serverErr:
+		if err != nil && !errors.Is(err, http.ErrServerClosed) {
+			log.Printf("HTTP server error: %v", err)
+		}
+	}
+
+	httpCtx, cancelHTTP := context.WithTimeout(
+		context.Background(),
+		5*time.Second,
+	)
+
+	if err := server.Shutdown(httpCtx); err != nil {
+		log.Printf("HTTP shutdown: %v", err)
+		_ = server.Close()
+	}
+	cancelHTTP()
+
+	cancelWorkers()
+	workers.Wait()
+
+	log.Println("Server stopped")
 }
